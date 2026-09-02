@@ -1,0 +1,27 @@
+# Large Training CSV (>100MB strictly rejected by GitHub)
+Split_1_Train_Hybrid.csv
+Final_Prediction_AD.xlsx
+Final_Prediction_AD1.xlsx
+Final_Prediction_AD_2025.xlsx
+
+# Temporary & Excel Lock Files
+~$*
+*.tmp
+
+# Python & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# OS specific
+Thumbs.db
+.DS_Store

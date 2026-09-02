@@ -1,0 +1,6 @@
+CODE,SMILES
+P38BS0100001,Nc1nc2c([nH]1)cccc2
+P38BS0100002,[O-][N+](=O)c1ccc2c(c1)nc([nH]2)N
+P38BS0102685,OCCSc1nc(c([nH]1)c1ccc(cc1)F)c1ccnc(c1)NC(C)C
+P38BS0103027,CC(Oc1nccc(n1)c1c(ncn1C1CCNCC1)c1ccc(cc1)F)C
+P38BS0103028,O=C(Nc1cc(nn1c1ccc(cc1)C)C(C)(C)C)NCc1ccccc1
