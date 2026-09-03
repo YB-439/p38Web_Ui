@@ -1,47 +1,123 @@
 import os
+import warnings
 import joblib
 import numpy as np
 import pandas as pd
 from typing import Dict, Any, List, Optional
 
-from rdkit import Chem, DataStructs, RDLogger
-from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+from rdkit import Chem, DataStructs, RDLogger, RDConfig
+from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, ChemicalFeatures
 from rdkit.Chem.Pharm2D import Gobbi_Pharm2D, Generate
 from rdkit.Chem.Draw import rdMolDraw2D
-import deepchem as dc
 from sklearn.neighbors import NearestNeighbors
 
-# Suppress noisy logs
+# Suppress all noisy warnings
+warnings.filterwarnings("ignore")
 RDLogger.DisableLog("rdApp.*")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.path.join(BASE_DIR, "Hybrid_RF_Final_Model.pkl")
 AD_MODEL_PATH = os.path.join(BASE_DIR, "app", "ad_model.joblib")
 
+# Atom & bond feature sets matching DeepChem default MolGraphConv specification
+DEFAULT_ATOM_TYPE_SET = ["C", "N", "O", "F", "P", "S", "Cl", "Br", "I"]
+DEFAULT_HYBRIDIZATION_SET = ["SP", "SP2", "SP3"]
+DEFAULT_TOTAL_NUM_HS_SET = [0, 1, 2, 3, 4]
+DEFAULT_TOTAL_DEGREE_SET = [0, 1, 2, 3, 4, 5]
+DEFAULT_BOND_TYPE_SET = [
+    Chem.rdchem.BondType.SINGLE,
+    Chem.rdchem.BondType.DOUBLE,
+    Chem.rdchem.BondType.TRIPLE,
+    Chem.rdchem.BondType.AROMATIC
+]
+DEFAULT_BOND_STEREO_SET = [
+    Chem.rdchem.BondStereo.STEREONONE,
+    Chem.rdchem.BondStereo.STEREOANY,
+    Chem.rdchem.BondStereo.STEREOZ,
+    Chem.rdchem.BondStereo.STEREOE
+]
+
+# Load BaseFeatures.fdef for hydrogen bond donor/acceptor calculation
+fdef_path = os.path.join(RDConfig.RDDataDir, "BaseFeatures.fdef")
+feature_factory = ChemicalFeatures.BuildFeatureFactory(fdef_path)
+
+def one_hot(val, allowable, include_unknown=True):
+    length = len(allowable) + (1 if include_unknown else 0)
+    vec = [0.0] * length
+    try:
+        idx = allowable.index(val)
+        vec[idx] = 1.0
+    except (ValueError, KeyError):
+        if include_unknown:
+            vec[-1] = 1.0
+    return vec
+
+def construct_atom_features(atom, h_bond_tuples, use_chirality=True):
+    # 1. Atom type (len 10)
+    vec = one_hot(atom.GetSymbol(), DEFAULT_ATOM_TYPE_SET, include_unknown=True)
+    # 2. Formal charge (len 1)
+    vec.append(float(atom.GetFormalCharge()))
+    # 3. Hybridization (len 3)
+    vec.extend(one_hot(str(atom.GetHybridization()), DEFAULT_HYBRIDIZATION_SET, include_unknown=False))
+    # 4. Hydrogen bonding donor/acceptor (len 2)
+    h_donor, h_acceptor = 0.0, 0.0
+    a_idx = atom.GetIdx()
+    for idx, fam in h_bond_tuples:
+        if idx == a_idx:
+            if fam == "Donor":
+                h_donor = 1.0
+            elif fam == "Acceptor":
+                h_acceptor = 1.0
+    vec.extend([h_donor, h_acceptor])
+    # 5. Aromatic (len 1)
+    vec.append(float(atom.GetIsAromatic()))
+    # 6. Degree (len 7: 0-5 + unknown)
+    vec.extend(one_hot(atom.GetTotalDegree(), DEFAULT_TOTAL_DEGREE_SET, include_unknown=True))
+    # 7. Total Num Hs (len 6: 0-4 + unknown)
+    vec.extend(one_hot(atom.GetTotalNumHs(), DEFAULT_TOTAL_NUM_HS_SET, include_unknown=True))
+    # 8. Chirality (len 2: R, S)
+    c_r, c_s = 0.0, 0.0
+    if use_chirality:
+        try:
+            code = atom.GetProp("_CIPCode")
+            if code == "R":
+                c_r = 1.0
+            elif code == "S":
+                c_s = 1.0
+        except Exception:
+            pass
+    vec.extend([c_r, c_s])
+    return np.array(vec, dtype=np.float32)
+
+def construct_bond_features(bond):
+    # 1. Bond type (len 4)
+    vec = one_hot(bond.GetBondType(), DEFAULT_BOND_TYPE_SET, include_unknown=False)
+    # 2. Same ring (len 1)
+    vec.append(float(bond.IsInRing()))
+    # 3. Conjugated (len 1)
+    vec.append(float(bond.GetIsConjugated()))
+    # 4. Stereo (len 5: None, Any, Z, E + unknown)
+    vec.extend(one_hot(bond.GetStereo(), DEFAULT_BOND_STEREO_SET, include_unknown=True))
+    return np.array(vec, dtype=np.float32)
+
+
 class HybridPredictor:
     def __init__(self):
         self.model = None
         self.ad_nn = None
         self.ad_threshold = 19.9646
-        self.featurizer = None
         self.pharm_size = None
         self.is_ready = False
         self._load_components()
 
     def _load_components(self):
-        print("[Predictor] Loading model and featurizers...")
+        print("[Predictor] Loading model and components...")
         if os.path.exists(MODEL_PATH):
             self.model = joblib.load(MODEL_PATH)
             print(f"[Predictor] Model loaded successfully: {type(self.model).__name__}")
         else:
             raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 
-        # Setup DeepChem MolGraphConvFeaturizer
-        self.featurizer = dc.feat.MolGraphConvFeaturizer(
-            use_edges=True,
-            use_chirality=True,
-            use_partial_charge=False
-        )
         self.pharm_size = Gobbi_Pharm2D.factory.GetSigSize()
 
         # Load AD artifact
@@ -78,19 +154,36 @@ class HybridPredictor:
         arr[list(fp.GetOnBits())] = 1
         return arr
 
-    def generate_graph(self, smiles: str, mol: Chem.Mol) -> np.ndarray:
+    def generate_graph(self, mol: Chem.Mol) -> np.ndarray:
+        if mol is None or mol.GetNumAtoms() <= 1:
+            return np.zeros(86, dtype=np.float32)
+
         try:
-            graph = self.featurizer.featurize([smiles])[0]
-            node_feat = graph.node_features
-            edge_feat = graph.edge_features
-            node_mean = np.mean(node_feat, axis=0)
-            node_std = np.std(node_feat, axis=0)
-            if edge_feat is not None and len(edge_feat) > 0:
-                edge_mean = np.mean(edge_feat, axis=0)
-                edge_std = np.std(edge_feat, axis=0)
+            feats = feature_factory.GetFeaturesForMol(mol)
+            h_bonds = [(f.GetAtomIds()[0], f.GetFamily()) for f in feats]
+            node_features = np.array([construct_atom_features(a, h_bonds, use_chirality=True) for a in mol.GetAtoms()], dtype=np.float32)
+
+            bonds = mol.GetBonds()
+            if bonds:
+                edge_features = []
+                for b in bonds:
+                    bf = construct_bond_features(b)
+                    edge_features.append(bf)
+                    edge_features.append(bf)
+                edge_features = np.array(edge_features, dtype=np.float32)
+            else:
+                edge_features = None
+
+            node_mean = np.mean(node_features, axis=0)
+            node_std  = np.std(node_features, axis=0)
+
+            if edge_features is not None and len(edge_features) > 0:
+                edge_mean = np.mean(edge_features, axis=0)
+                edge_std  = np.std(edge_features, axis=0)
             else:
                 edge_mean = np.zeros(11, dtype=np.float32)
-                edge_std = np.zeros(11, dtype=np.float32)
+                edge_std  = np.zeros(11, dtype=np.float32)
+
             desc = np.concatenate([node_mean, node_std, edge_mean, edge_std])
             return desc.astype(np.float32)
         except Exception:
@@ -104,7 +197,7 @@ class HybridPredictor:
 
         morgan = self.generate_morgan(mol)
         pharm = self.generate_pharm(mol)
-        graph = self.generate_graph(smiles, mol)
+        graph = self.generate_graph(mol)
 
         hybrid = np.concatenate([morgan, pharm, graph]).astype(np.float32)
         return hybrid
